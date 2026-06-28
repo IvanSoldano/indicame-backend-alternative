@@ -1,0 +1,16 @@
+POST https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent HTTP/1.1
+Host: generativelanguage.googleapis.com
+Content-Type: application/json
+X-goog-api-key: AIzaSyB64VQ2dZoo3mnNdmWaQAoSgMib0RDcC1w
+
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "Explain how AI works in a few words"
+        }
+      ]
+    }
+  ]
+}

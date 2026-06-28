@@ -1,0 +1,6 @@
+POST http://localhost:3000/api/alt/indicaciones/generadas-v4
+Content-Type: application/json
+
+{
+    "practicas_ids": [69240, 69241, 69758, 69558]
+}
