@@ -542,7 +542,7 @@ router.post('/generadas-v4', async function (request, response) {
 
   safeDatabaseTree.forEach(function (document) {
     const finalBlocksArray = [];
-    const finalResultTextArray = []; 
+    const finalResultTextArray = [];
     usedDocsIds.push(document.id);
 
     const rawBlocks = document.alt_blocks || [];
@@ -631,11 +631,26 @@ router.post('/generadas-v4', async function (request, response) {
       };
     } else {
       // Call Gemini AI
-      const allDocsText = finalDocs.map(d => d.final_result.join('\n')).join('\n\n---\n\n');
-      
+      // 1. Optimización de los datos enviados a la LLM
+      // En lugar de texto plano, estructuramos la entrada para que el modelo procese mejor los tokens.
+      const inputDocsForLLM = finalDocs.map((d, index) => ({
+        origen: `Practica_${index + 1}`,
+        indicaciones: d.final_result.join(' ').trim()
+      }));
+
       try {
-        const systemPrompt = "You are a helpful assistant. Try to mix all the provided documents into one cohesive and organized document. Ensure no information is lost, but try to avoid repeating identical instructions or contradicting parts. Combine them logically.";
-        
+        // 2. System Prompt Refinado (Reglas de Negocio + Contexto Local)
+        const systemPrompt = `Sos un experto en documentación clínica y atención al paciente en Argentina.
+      Tu objetivo es unificar múltiples documentos de indicaciones médicas (para laboratorio y diagnóstico por imágenes) en un único texto cohesivo, claro y seguro para el paciente.
+
+      REGLAS ESTRICTAS:
+      1. Usa lenguaje claro, empático y adaptado a pacientes de Argentina y que tenga claridad hasta para pacientes con distintos niveles de educación.
+      2. Elimina redundancias sin perder información crítica.
+      3. Agrupa la información de forma lógica y cronológica (ej. Preparación previa, Día del estudio, Documentación a llevar).
+      4. RESOLUCIÓN DE CONFLICTOS: Si hay indicaciones contradictorias (ej. un estudio pide 8hs de ayuno y otro 12hs), debes conservar la restricción más estricta (12hs) para que ambos estudios puedan realizarse, o intentar integrarlas lógicamente. 
+      5. Si las contradicciones son mutuamente excluyentes y ponen en riesgo la preparación del paciente, debes fallar y marcar 'exito' como false.`;
+
+        // 3. Configuración del Payload con Schema JSON
         const geminiPayload = {
           system_instruction: {
             parts: [{ text: systemPrompt }]
@@ -643,10 +658,33 @@ router.post('/generadas-v4', async function (request, response) {
           contents: [
             {
               parts: [
-                { text: "Here are the documents to mix:\n\n" + allDocsText }
+                { text: "Analiza y combina las siguientes indicaciones médicas:\n" + JSON.stringify(inputDocsForLLM, null, 2) }
               ]
             }
-          ]
+          ],
+          generationConfig: {
+            response_mime_type: "application/json",
+            // Definimos el contrato de salida estricto
+            response_schema: {
+              type: "OBJECT",
+              properties: {
+                exito: {
+                  type: "BOOLEAN",
+                  description: "True si se pudieron combinar las indicaciones de forma segura, False si hay contradicciones insalvables."
+                },
+                texto_combinado: {
+                  type: "STRING",
+                  description: "El texto unificado y formateado en Markdown. Vacío si exito es false."
+                },
+                motivo_fallo: {
+                  type: "STRING",
+                  description: "Breve explicación técnica de por qué falló la combinación. Vacío si exito es true."
+                }
+              },
+              required: ["exito", "texto_combinado", "motivo_fallo"]
+            },
+            temperature: 0.1 // Baja temperatura para minimizar alucinaciones en textos médicos
+          }
         };
 
         const geminiResponse = await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent', {
@@ -661,19 +699,32 @@ router.post('/generadas-v4', async function (request, response) {
         if (geminiResponse.ok) {
           const geminiData = await geminiResponse.json();
           if (geminiData.candidates && geminiData.candidates.length > 0) {
-            const aiMixedResultText = geminiData.candidates[0].content.parts[0].text;
-            
-            // Store in alt_cache
-            const { data: insertData } = await supabase.from('alt_cache').insert({
-              hashed_texts_ids: hashId,
-              result: aiMixedResultText
-            }).select('id').single();
-            
-            aiMixedResponse = {
-              generated_text: aiMixedResultText,
-              hashed_texts_ids: hashId,
-              id: insertData ? insertData.id : null
-            };
+            // El texto ahora es un JSON string parseable gracias al generationConfig
+            const aiRawOutput = geminiData.candidates[0].content.parts[0].text;
+            const parsedResult = JSON.parse(aiRawOutput);
+
+            if (parsedResult.exito) {
+              // Solo guardamos en caché y avanzamos si fue exitoso
+              const { data: insertData } = await supabase.from('alt_cache').insert({
+                hashed_texts_ids: hashId,
+                result: parsedResult.texto_combinado
+              }).select('id').single();
+
+              aiMixedResponse = {
+                generated_text: parsedResult.texto_combinado,
+                hashed_texts_ids: hashId,
+                id: insertData ? insertData.id : null,
+                status: "success"
+              };
+            } else {
+              // Manejo del rechazo por lógicas médicas
+              console.warn("La IA determinó que los textos son incompatibles:", parsedResult.motivo_fallo);
+              aiMixedResponse = {
+                generated_text: "No se pudieron combinar las indicaciones debido a un conflicto médico. Consulte con el sector correspondiente.",
+                status: "failed_by_ai",
+                reason: parsedResult.motivo_fallo
+              };
+            }
           }
         } else {
           console.error("Gemini API error:", await geminiResponse.text());
